@@ -447,19 +447,29 @@ function extractTranscriptFromPage() {
           video.pause();
         }
 
-        let segments = document.querySelectorAll("ytd-transcript-segment-renderer");
+        // Shadow-DOM-inclusive: the button search already had to pierce shadow
+        // roots to find "스크립트 표시" at all, so the segment list rendered
+        // after clicking it is very likely nested in shadow DOM too — a plain
+        // document.querySelectorAll here silently returns nothing even while
+        // the panel is visibly showing content on screen.
+        let segments = deepQueryAll("ytd-transcript-segment-renderer");
         if (!segments.length) {
-          // Layout/tag fallback: read whatever rendered inside the transcript panel.
-          const panel = document.querySelector("ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer #segments-container");
-          if (panel && panel.innerText.trim()) {
-            resolve({ transcript: panel.innerText.trim(), title });
+          // Layout/tag fallback: grab whatever rendered inside the transcript
+          // panel as a whole (covers chapter-grouped panels where individual
+          // segment renderers might use a different tag).
+          const panels = deepQueryAll(
+            "ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer, #segments-container"
+          ).filter((el) => visible(el) && el.innerText && el.innerText.trim().length > 20);
+          const panelText = panels.map((p) => p.innerText.trim()).sort((a, b) => b.length - a.length)[0];
+          if (panelText) {
+            resolve({ transcript: panelText, title });
             return;
           }
-          diag.push("버튼클릭: 패널 열었지만 세그먼트 없음");
+          diag.push("버튼클릭: 패널 열었지만 세그먼트 없음(shadow DOM 포함해서도 못 찾음)");
           resolve({ error: "자막을 못 가져왔어요.\n\n[디버그]\n" + diag.join("\n") });
           return;
         }
-        const transcript = [...segments]
+        const transcript = segments
           .map((s) => s.innerText.trim())
           .filter(Boolean)
           .join("\n");
