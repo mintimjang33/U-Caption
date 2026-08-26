@@ -71,8 +71,7 @@ const baseHandler = createMcpHandler(
         return { content: [{ type: 'text', text: '아직 처리 중이에요(대기중). 잠시 후 다시 확인해주세요.' }] };
       }
     );
-  },
-  { verboseLogs: true }
+  }
 );
 
 async function authedHandler(request: Request) {
