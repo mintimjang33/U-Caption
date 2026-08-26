@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "U-Caption",
+  "version": "1.0.0",
+  "description": "유튜브 영상 자막을 실시간으로 가져와 로컬 MCP 서버(Claude)로 전달합니다.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "U-Caption"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": ["https://www.youtube.com/*"],
+  "permissions": ["alarms", "tabs", "scripting"]
+}
