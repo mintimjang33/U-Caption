@@ -34,7 +34,10 @@ export async function GET(request: Request) {
   return NextResponse.json({ jobs: data || [] });
 }
 
-// POST /api/uc-jobs?key=... — 새 자막 요청 작업을 큐에 등록. body: { url }
+// POST /api/uc-jobs?key=... — 새 작업을 등록. body: { url, transcript?, title?, lang? }
+// transcript가 같이 오면(크롬 확장 팝업의 "MCP로 보내기" 버튼 — 이미 결과를 손에 쥔 상태) 곧바로
+// status='done'으로 등록한다. transcript 없이 url만 오면(MCP get_youtube_transcript 툴) 'queued'로
+// 등록해서 로컬 확장이 폴링해 처리하도록 큐에 올린다.
 export async function POST(request: Request) {
   if (!checkKey(request)) return NextResponse.json({ error: '인증 필요' }, { status: 401 });
   const body = await request.json().catch(() => null);
@@ -45,11 +48,10 @@ export async function POST(request: Request) {
   if (!videoId) return NextResponse.json({ error: '유효한 유튜브 링크가 아닙니다.' }, { status: 400 });
 
   const supabase = getSupabaseServerClient();
-  const { data, error } = await supabase
-    .from('uc_jobs')
-    .insert({ video_id: videoId, url, status: 'queued' })
-    .select()
-    .single();
+  const insert = body.transcript
+    ? { video_id: videoId, url, status: 'done', title: body.title || null, transcript: body.transcript, lang: body.lang || null }
+    : { video_id: videoId, url, status: 'queued' };
+  const { data, error } = await supabase.from('uc_jobs').insert(insert).select().single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ job: data });
 }

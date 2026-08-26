@@ -463,6 +463,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true; // keep the message channel open for the async response
   }
+  if (msg.type === "push_to_remote") {
+    const r = msg.result || {};
+    fetch(`${UC_WEB_BASE}/api/uc-jobs?key=${UC_SHARED_SECRET}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: r.url, title: r.title, transcript: r.transcript, lang: r.lang }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.error) sendResponse({ ok: false, error: data.error });
+        else sendResponse({ ok: true, job: data.job });
+      })
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
 });
 
 // --- Remote job queue (HongHub) ------------------------------------------
