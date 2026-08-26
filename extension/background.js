@@ -470,7 +470,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // with this local WebSocket bridge running: Claude registers a job in
 // Supabase via HongHub's remote MCP, and this extension polls for queued
 // jobs and fulfills them the same way as the popup's manual button.
-const UC_WEB_BASE = "https://u-caption.vercel.app";
+const UC_WEB_BASE = "https://u-caption-lake.vercel.app";
 const UC_SHARED_SECRET = "ucaption_admin_2026";
 
 async function pollRemoteJobs() {

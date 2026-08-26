@@ -10,6 +10,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "host_permissions": ["https://www.youtube.com/*", "https://u-caption.vercel.app/*"],
+  "host_permissions": ["https://www.youtube.com/*", "https://u-caption-lake.vercel.app/*"],
   "permissions": ["alarms", "tabs", "scripting"]
 }
