@@ -48,9 +48,14 @@ export async function POST(request: Request) {
   if (!videoId) return NextResponse.json({ error: '유효한 유튜브 링크가 아닙니다.' }, { status: 400 });
 
   const supabase = getSupabaseServerClient();
-  const insert = body.transcript
-    ? { video_id: videoId, url, status: 'done', title: body.title || null, transcript: body.transcript, lang: body.lang || null }
-    : { video_id: videoId, url, status: 'queued' };
+  const insert = {
+    video_id: videoId,
+    url,
+    status: body.transcript ? 'done' : 'queued',
+    title: body.title || null,
+    transcript: body.transcript || null,
+    lang: body.lang || null,
+  };
   const { data, error } = await supabase.from('uc_jobs').insert(insert).select().single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ job: data });

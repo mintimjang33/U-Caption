@@ -211,6 +211,37 @@ function fetchTranscriptViaTab(videoId) {
   });
 }
 
+// Navigates an existing tab to a new URL and resolves once it's fully loaded.
+// Used to move a Shorts tab to the equivalent /watch page before extraction.
+function navigateTabAndWait(tabId, url) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeoutTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      reject(new Error("쇼츠 → 일반 영상 페이지 전환이 시간 내에 끝나지 않았어요."));
+    }, TAB_LOAD_TIMEOUT_MS);
+
+    const onUpdated = (updatedTabId, info) => {
+      if (updatedTabId !== tabId || info.status !== "complete" || settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.update(tabId, { url }, () => {
+      if (chrome.runtime.lastError) {
+        settled = true;
+        clearTimeout(timeoutTimer);
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        reject(new Error(chrome.runtime.lastError.message));
+      }
+    });
+  });
+}
+
 async function runExtractionInTab(tabId) {
   // world: "MAIN" is required — the default isolated world content-script
   // context cannot see page-set globals like `ytInitialPlayerResponse` or
@@ -457,7 +488,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // rendered, not throttled) instead of opening a new background tab —
     // background tabs get their rendering/timers throttled by Chrome, which
     // was silently breaking the "더보기"/transcript-button detection below.
-    const extraction = msg.tabId != null ? runExtractionInTab(msg.tabId) : fetchTranscript(videoId);
+    // Shorts pages (/shorts/<id>) have a completely different layout with no
+    // description/transcript panel at all, so if the current tab is on one,
+    // switch that same tab to the equivalent /watch?v= page first — the
+    // transcript UI only exists there.
+    const isShorts = (msg.url || "").includes("/shorts/");
+    const prep =
+      msg.tabId != null && isShorts
+        ? navigateTabAndWait(msg.tabId, `https://www.youtube.com/watch?v=${videoId}`)
+        : Promise.resolve();
+    const extraction = prep.then(() =>
+      msg.tabId != null ? runExtractionInTab(msg.tabId) : fetchTranscript(videoId)
+    );
     extraction
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
