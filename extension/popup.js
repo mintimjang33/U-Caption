@@ -17,7 +17,7 @@ function refreshStatus() {
 btn.addEventListener("click", async () => {
   output.textContent = "가져오는 중...";
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  chrome.runtime.sendMessage({ type: "fetch_current", url: tab?.url || "" }, (res) => {
+  chrome.runtime.sendMessage({ type: "fetch_current", url: tab?.url || "", tabId: tab?.id }, (res) => {
     if (chrome.runtime.lastError) {
       output.textContent = "오류: " + chrome.runtime.lastError.message;
       return;

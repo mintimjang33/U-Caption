@@ -167,13 +167,15 @@ function parseTranscriptXml(xml) {
     .join("\n");
 }
 
-// --- Fallback path: open the video in a background (inactive) tab and
-// drive the same "스크립트 표시(Show transcript)" UI a real user would
-// click, then read the rendered transcript panel text. Muted + paused
-// immediately so it never produces sound or plays video. ----------------
+// --- Fallback path: open the video in a tab and drive the same
+// "스크립트 표시(Show transcript)" UI a real user would click, then read
+// the rendered transcript panel text. Muted + paused immediately so it
+// never produces sound. Opened active (not background) because Chrome
+// throttles rendering/timers in inactive tabs badly enough that the
+// description-expand/transcript-button detection below silently fails. --
 function fetchTranscriptViaTab(videoId) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}`, active: false }, (tab) => {
+    chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}`, active: true }, (tab) => {
       if (chrome.runtime.lastError || !tab?.id) {
         reject(new Error(chrome.runtime.lastError?.message || "탭을 열지 못했어요."));
         return;
@@ -210,8 +212,14 @@ function fetchTranscriptViaTab(videoId) {
 }
 
 async function runExtractionInTab(tabId) {
+  // world: "MAIN" is required — the default isolated world content-script
+  // context cannot see page-set globals like `ytInitialPlayerResponse` or
+  // `ytcfg` (separate JS scope from the page even though the DOM is shared).
+  // Running in MAIN world also means our fetch to the innertube endpoint
+  // below looks exactly like a request the page itself would make.
   const injectionResults = await chrome.scripting.executeScript({
     target: { tabId },
+    world: "MAIN",
     func: extractTranscriptFromPage,
   });
   const result = injectionResults?.[0]?.result;
@@ -240,22 +248,164 @@ function extractTranscriptFromPage() {
           video.pause();
         }
 
-        const moreBtn = [...document.querySelectorAll("tp-yt-paper-button, button, ytd-button-renderer")].find(
-          (b) => /더보기|more/i.test((b.innerText || b.getAttribute("aria-label") || "").trim()) && b.offsetHeight > 0
-        );
-        if (moreBtn) {
-          moreBtn.click();
-          await wait(800);
+        const titleEl = document.querySelector("h1.ytd-watch-metadata, h1 yt-formatted-string");
+        const title = titleEl ? titleEl.innerText.trim() : document.title.replace(/ - YouTube$/, "");
+
+        const decodeEntities = (s) =>
+          s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+        const xmlToTranscript = (xml) =>
+          [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
+            .map((mm) => decodeEntities(mm[1].replace(/<[^>]+>/g, "")).trim())
+            .filter(Boolean)
+            .join("\n");
+
+        const diag = []; // collects a one-line reason from each failed attempt for debugging
+
+        async function tracksFromTimedText(tracks) {
+          if (!tracks || tracks.length === 0) return { fail: "captionTracks 없음" };
+          const track = tracks.find((t) => t.languageCode === "ko") || tracks.find((t) => t.languageCode?.startsWith("en")) || tracks[0];
+          const res = await fetch(track.baseUrl);
+          if (!res.ok) return { fail: `timedtext fetch 실패 status=${res.status}` };
+          const xml = await res.text();
+          const transcript = xmlToTranscript(xml);
+          if (!transcript) return { fail: `timedtext 응답이 비어있음(len=${xml.length})` };
+          return { transcript, lang: track.languageCode };
         }
 
-        const findButton = (label) =>
-          [...document.querySelectorAll("button")].find(
-            (b) => (b.getAttribute("aria-label") || b.innerText || "").trim() === label && b.offsetHeight > 0
-          );
+        // --- Preferred path: call YouTube's own InnerTube `/player` endpoint
+        // (the same endpoint the page itself calls) from inside the MAIN
+        // world, using the page's real API key/session. This is the current
+        // (2026) reliable way to get captionTracks without depending on any
+        // particular transcript-panel UI/labels existing. ---------------------
+        try {
+          const apiKey =
+            (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("INNERTUBE_API_KEY")) ||
+            "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+          const clientVersion =
+            (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("INNERTUBE_CLIENT_VERSION")) || "2.20240101.00.00";
+          const videoId = new URLSearchParams(location.search).get("v") || location.pathname.match(/\/shorts\/([^/?]+)/)?.[1];
 
-        const transcriptBtn = findButton("스크립트 표시") || findButton("Show transcript");
+          const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              context: { client: { clientName: "WEB", clientVersion } },
+              videoId,
+            }),
+          });
+          if (!res.ok) {
+            diag.push(`innertube: HTTP ${res.status}`);
+          } else {
+            const data = await res.json();
+            const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            const r = await tracksFromTimedText(tracks);
+            if (r.transcript) {
+              resolve({ transcript: r.transcript, title, lang: r.lang });
+              return;
+            }
+            diag.push(`innertube: ${r.fail}`);
+          }
+        } catch (e) {
+          diag.push(`innertube: 예외 ${e.message}`);
+        }
+
+        // --- Second path: read caption tracks straight off the page's own
+        // ytInitialPlayerResponse global (only reachable because we're running
+        // in the MAIN world). ---------------------------------------------------
+        try {
+          let playerResponse = window.ytInitialPlayerResponse;
+          if (!playerResponse) {
+            const scriptText = [...document.scripts].map((s) => s.textContent).find((t) => t && t.includes("ytInitialPlayerResponse"));
+            const m = scriptText && scriptText.match(/ytInitialPlayerResponse\s*=\s*(\{.*?\});/s);
+            if (m) playerResponse = JSON.parse(m[1]);
+          }
+          if (!playerResponse) {
+            diag.push("ytInitialPlayerResponse: 못 찾음");
+          } else {
+            const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            const r = await tracksFromTimedText(tracks);
+            if (r.transcript) {
+              resolve({ transcript: r.transcript, title, lang: r.lang });
+              return;
+            }
+            diag.push(`ytInitialPlayerResponse: ${r.fail}`);
+          }
+        } catch (e) {
+          diag.push(`ytInitialPlayerResponse: 예외 ${e.message}`);
+        }
+
+        // --- Fallback: drive the real "Show transcript" UI directly. This is
+        // the only genuinely reliable method — YouTube's timedtext endpoint
+        // requires a runtime-generated PoToken with no documented way to
+        // supply one from outside the player, so clicking the real button
+        // (which lets the already-authenticated player fetch it) is required.
+        // As of the Feb 2026 YouTube UI update, the button only renders once
+        // the video description panel is expanded. -----------------------------
+        // Walk the whole tree INCLUDING shadow roots — many ytd-* polymer
+        // elements attach shadow DOM, so a plain document.querySelectorAll
+        // silently misses anything nested inside one.
+        function deepQueryAll(selector, root = document) {
+          const out = [...root.querySelectorAll(selector)];
+          for (const el of root.querySelectorAll("*")) {
+            if (el.shadowRoot) out.push(...deepQueryAll(selector, el.shadowRoot));
+          }
+          return out;
+        }
+        const clickableEls = () =>
+          deepQueryAll("button, tp-yt-paper-button, yt-button-shape, ytd-button-renderer, ytd-menu-service-item-renderer, tp-yt-paper-item, [role='button']");
+        const visible = (el) => el.offsetHeight > 0 || el.getClientRects().length > 0;
+        const textOf = (el) => (el.getAttribute("aria-label") || el.innerText || el.textContent || "").trim();
+        const findByPattern = (re) => clickableEls().find((b) => visible(b) && re.test(textOf(b)));
+
+        document.querySelector("ytd-watch-metadata, #description")?.scrollIntoView({ block: "center" });
+        await wait(300);
+
+        // "#expand" is the description panel's own long-standing expand toggle
+        // (distinct from any other "더보기" on the page — comments, etc.).
+        // ytd-video-description-transcript-section-renderer (which holds the
+        // real 스크립트 표시/Show transcript button) only becomes visible once
+        // this specific panel is expanded.
+        const expandBtn =
+          deepQueryAll("#expand, tp-yt-paper-button#expand").find((b) => visible(b)) ||
+          findByPattern(/더\s*보기|more|show more/i);
+        if (expandBtn) {
+          expandBtn.click();
+          await wait(1200);
+        } else {
+          diag.push('버튼클릭: "더보기" 버튼도 못 찾음(설명란 확장 실패)');
+        }
+
+        // Prefer the button nested specifically inside the transcript section
+        // renderer we now know exists — far more targeted than a page-wide
+        // text search that can grab an unrelated "더보기".
+        const transcriptSection = deepQueryAll("ytd-video-description-transcript-section-renderer")[0];
+        let transcriptBtn =
+          (transcriptSection && deepQueryAll("button", transcriptSection).find((b) => visible(b))) ||
+          findByPattern(/스크립트\s*표시|show\s*transcript|자막\s*표시|대본\s*표시/i);
+
+        // Some layouts expose it via a "..." (more actions) menu near the
+        // like/share row instead of inside the description.
         if (!transcriptBtn) {
-          resolve({ error: "이 영상에는 자막(스크립트)이 없는 것 같아요." });
+          const moreActionsBtn = findByPattern(/더보기 작업|more actions/i);
+          if (moreActionsBtn) {
+            moreActionsBtn.click();
+            await wait(600);
+            transcriptBtn = findByPattern(/스크립트\s*표시|show\s*transcript|자막\s*표시|대본\s*표시|transcript/i);
+          }
+        }
+
+        if (!transcriptBtn) {
+          // Last resort: dump anything anywhere in the (shadow-inclusive) tree
+          // whose text/aria-label even mentions transcript/스크립트/자막/대본,
+          // regardless of tag or visibility, so we can see the real element
+          // next time instead of guessing again.
+          const candidates = deepQueryAll("*")
+            .filter((el) => /transcript|스크립트|자막|대본/i.test(textOf(el)) && textOf(el).length < 60)
+            .slice(0, 8)
+            .map((el) => `<${el.tagName.toLowerCase()}> "${textOf(el)}" visible=${visible(el)}`);
+          diag.push("버튼클릭: 스크립트 버튼 못 찾음");
+          diag.push(candidates.length ? "후보들:\n" + candidates.join("\n") : "후보 요소 자체가 전혀 없음");
+          resolve({ error: "자막을 못 가져왔어요.\n\n[디버그]\n" + diag.join("\n") });
           return;
         }
         transcriptBtn.click();
@@ -266,18 +416,22 @@ function extractTranscriptFromPage() {
           video.pause();
         }
 
-        const segments = document.querySelectorAll("ytd-transcript-segment-renderer");
+        let segments = document.querySelectorAll("ytd-transcript-segment-renderer");
         if (!segments.length) {
-          resolve({ error: "자막 패널을 열었지만 내용을 읽지 못했어요." });
+          // Layout/tag fallback: read whatever rendered inside the transcript panel.
+          const panel = document.querySelector("ytd-transcript-search-panel-renderer, ytd-engagement-panel-section-list-renderer #segments-container");
+          if (panel && panel.innerText.trim()) {
+            resolve({ transcript: panel.innerText.trim(), title });
+            return;
+          }
+          diag.push("버튼클릭: 패널 열었지만 세그먼트 없음");
+          resolve({ error: "자막을 못 가져왔어요.\n\n[디버그]\n" + diag.join("\n") });
           return;
         }
         const transcript = [...segments]
           .map((s) => s.innerText.trim())
           .filter(Boolean)
           .join("\n");
-
-        const titleEl = document.querySelector("h1.ytd-watch-metadata, h1 yt-formatted-string");
-        const title = titleEl ? titleEl.innerText.trim() : document.title.replace(/ - YouTube$/, "");
 
         resolve({ transcript, title });
       } catch (e) {
@@ -299,21 +453,67 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: false, error: "현재 탭이 유튜브 영상 페이지가 아니에요." });
       return true;
     }
-    fetchTranscript(videoId)
+    // Extract directly on the tab the user is already looking at (fully
+    // rendered, not throttled) instead of opening a new background tab —
+    // background tabs get their rendering/timers throttled by Chrome, which
+    // was silently breaking the "더보기"/transcript-button detection below.
+    const extraction = msg.tabId != null ? runExtractionInTab(msg.tabId) : fetchTranscript(videoId);
+    extraction
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true; // keep the message channel open for the async response
   }
 });
 
+// --- Remote job queue (HongHub) ------------------------------------------
+// Lets Claude request a transcript from ANY session/device, not just one
+// with this local WebSocket bridge running: Claude registers a job in
+// Supabase via HongHub's remote MCP, and this extension polls for queued
+// jobs and fulfills them the same way as the popup's manual button.
+const UC_WEB_BASE = "https://u-caption.vercel.app";
+const UC_SHARED_SECRET = "b71baf5f5ebee5426118eed42997f21b9010d65e35c7e200";
+
+async function pollRemoteJobs() {
+  try {
+    const res = await fetch(`${UC_WEB_BASE}/api/uc-jobs?status=queued&key=${UC_SHARED_SECRET}`);
+    if (!res.ok) return;
+    const { jobs } = await res.json();
+    for (const job of jobs || []) {
+      try {
+        const result = await fetchTranscriptViaTab(job.video_id);
+        await fetch(`${UC_WEB_BASE}/api/uc-jobs/${job.id}?key=${UC_SHARED_SECRET}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "done", title: result.title, transcript: result.transcript, lang: result.lang }),
+        });
+      } catch (err) {
+        await fetch(`${UC_WEB_BASE}/api/uc-jobs/${job.id}?key=${UC_SHARED_SECRET}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "error", error: err.message }),
+        }).catch(() => {});
+      }
+    }
+  } catch {
+    // remote server unreachable (offline, etc.) — just skip this cycle
+  }
+}
+
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 
 // MV3 service workers unload when idle; this alarm both wakes the worker
-// back up periodically and re-checks/re-establishes the WebSocket connection.
+// back up periodically, re-checks/re-establishes the WebSocket connection,
+// and polls HongHub for any remotely-queued transcript jobs. Chrome alarms
+// can't fire more often than once a minute, so a remote request can take up
+// to ~1 minute to even be picked up.
 chrome.alarms.create("u-caption-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "u-caption-keepalive") connect();
+  if (alarm.name === "u-caption-keepalive") {
+    connect();
+    pollRemoteJobs();
+  }
 });
 
 connect();
+pollRemoteJobs();
