@@ -1,6 +1,6 @@
 const WS_URL = "ws://localhost:8765";
 const RECONNECT_DELAY_MS = 3000;
-const TAB_LOAD_TIMEOUT_MS = 15000;
+const TAB_LOAD_TIMEOUT_MS = 30000;
 
 let socket = null;
 let reconnectTimer = null;
@@ -87,73 +87,67 @@ function extractVideoId(url) {
 // --- Main entry point: try the fast (no visible tab) path first, then
 // fall back to driving the real YouTube UI in a background tab. ---------
 async function fetchTranscript(videoId) {
-  const meta = await fetchWatchPageMeta(videoId);
+  let fastFail = null;
+  try {
+    const fast = await fetchViaAndroidInnertube(videoId);
+    if (fast) return fast;
+    fastFail = "결과 없음(트랙/자막 XML이 비어있음)";
+  } catch (e) {
+    fastFail = e.message;
+  }
 
   try {
-    const fast = await tryFetchViaTimedText(meta.tracks);
-    if (fast) {
-      return { title: meta.title, lang: fast.lang, transcript: fast.transcript };
-    }
-  } catch {
-    // fall through to the tab-based method below
+    const viaTab = await fetchTranscriptViaTab(videoId);
+    return { title: viaTab.title, lang: viaTab.lang || null, transcript: viaTab.transcript };
+  } catch (tabErr) {
+    // Surface WHY the fast (no-tab) path failed too, since that's the one
+    // that should normally succeed — without this, every failure just looks
+    // like a generic tab timeout with no way to diagnose the real cause.
+    throw new Error(`${tabErr.message} [빠른경로 실패이유: ${fastFail}]`);
   }
-
-  const viaTab = await fetchTranscriptViaTab(videoId);
-  return {
-    title: meta.title || viaTab.title,
-    lang: viaTab.lang || null,
-    transcript: viaTab.transcript,
-  };
 }
 
-// --- Fast path: fetch the watch page HTML (for title + caption track
-// list) and try to fetch the raw timedtext XML directly. YouTube
-// increasingly blocks this (empty 200 response) for non-session
-// requests, so this is a best-effort attempt only. ----------------------
-async function fetchWatchPageMeta(videoId) {
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const res = await fetch(watchUrl, { credentials: "include" });
-  if (!res.ok) {
-    throw new Error(`유튜브 페이지를 불러오지 못했어요 (status ${res.status})`);
-  }
-  const html = await res.text();
+// --- Fast path: ask YouTube's own InnerTube `/player` endpoint for this
+// video, but impersonating the ANDROID client instead of WEB. The web
+// player's caption track URLs return an empty 200 body unless the request
+// carries a runtime-generated PoToken; tracks issued to the ANDROID client
+// don't have that requirement (well-known workaround used by e.g. the
+// youtube-transcript-api project), so this is now the primary path and
+// usually succeeds without ever opening a tab. -----------------------------
+const ANDROID_INNERTUBE_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+const ANDROID_CONTEXT = { client: { clientName: "ANDROID", clientVersion: "20.10.38" } };
 
-  const titleMatch = html.match(/<title>([^<]*)<\/title>/);
-  const title = titleMatch ? titleMatch[1].replace(/ - YouTube$/, "") : null;
-
-  const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.*?\});/s);
-  if (!playerMatch) {
-    return { title, tracks: [] };
-  }
-  let data;
-  try {
-    data = JSON.parse(playerMatch[1]);
-  } catch {
-    return { title, tracks: [] };
-  }
-  const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  return { title, tracks };
-}
-
-async function tryFetchViaTimedText(tracks) {
+async function fetchViaAndroidInnertube(videoId) {
+  const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${ANDROID_INNERTUBE_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ context: ANDROID_CONTEXT, videoId }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const title = data?.videoDetails?.title || null;
+  const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!tracks || tracks.length === 0) return null;
+
   const track =
     tracks.find((t) => t.languageCode === "ko") ||
     tracks.find((t) => t.languageCode?.startsWith("en")) ||
     tracks[0];
 
-  const res = await fetch(track.baseUrl, { credentials: "include" });
-  if (!res.ok) return null;
-  const xml = await res.text();
+  const xmlRes = await fetch(track.baseUrl);
+  if (!xmlRes.ok) return null;
+  const xml = await xmlRes.text();
   if (!xml || xml.trim().length === 0) return null;
 
   const transcript = parseTranscriptXml(xml);
   if (!transcript) return null;
-  return { transcript, lang: track.languageCode };
+  return { title, lang: track.languageCode, transcript };
 }
 
+// ANDROID-client-issued timedtext URLs come back as "srv3" format
+// (<p> cue blocks containing <s> word/phrase spans) rather than the older
+// <text> element format some other clients still return. Handle both.
 function parseTranscriptXml(xml) {
-  const matches = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
   const decodeEntities = (s) =>
     s
       .replace(/&amp;/g, "&")
@@ -161,8 +155,12 @@ function parseTranscriptXml(xml) {
       .replace(/&gt;/g, ">")
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'");
-  return matches
-    .map((m) => decodeEntities(m[1].replace(/<[^>]+>/g, "")).trim())
+
+  const textMatches = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
+  const source = textMatches.length > 0 ? textMatches : [...xml.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g)];
+
+  return source
+    .map((m) => decodeEntities(m[1].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .join("\n");
 }
@@ -179,6 +177,14 @@ function fetchTranscriptViaTab(videoId) {
       if (chrome.runtime.lastError || !tab?.id) {
         reject(new Error(chrome.runtime.lastError?.message || "탭을 열지 못했어요."));
         return;
+      }
+      // "active" only makes it the front tab WITHIN its window — if the
+      // Chrome window itself isn't focused (minimized, another app in
+      // front), rendering/timers still get throttled the same as a
+      // background tab, which was silently causing the extraction below
+      // to blow past the load timeout. Force the window to the foreground too.
+      if (tab.windowId != null) {
+        chrome.windows.update(tab.windowId, { focused: true }, () => void chrome.runtime.lastError);
       }
       const tabId = tab.id;
       let settled = false;
@@ -284,11 +290,16 @@ function extractTranscriptFromPage() {
 
         const decodeEntities = (s) =>
           s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-        const xmlToTranscript = (xml) =>
-          [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
-            .map((mm) => decodeEntities(mm[1].replace(/<[^>]+>/g, "")).trim())
+        // ANDROID-client timedtext URLs come back as "srv3" (<p><s>...) rather
+        // than the older <text> element format; handle both.
+        const xmlToTranscript = (xml) => {
+          const textMatches = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
+          const source = textMatches.length > 0 ? textMatches : [...xml.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g)];
+          return source
+            .map((mm) => decodeEntities(mm[1].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim())
             .filter(Boolean)
             .join("\n");
+        };
 
         const diag = []; // collects a one-line reason from each failed attempt for debugging
 
@@ -303,24 +314,23 @@ function extractTranscriptFromPage() {
           return { transcript, lang: track.languageCode };
         }
 
-        // --- Preferred path: call YouTube's own InnerTube `/player` endpoint
-        // (the same endpoint the page itself calls) from inside the MAIN
-        // world, using the page's real API key/session. This is the current
-        // (2026) reliable way to get captionTracks without depending on any
-        // particular transcript-panel UI/labels existing. ---------------------
+        // --- Preferred path: call YouTube's own InnerTube `/player` endpoint,
+        // impersonating the ANDROID client instead of WEB. The WEB player's
+        // caption track URLs return an empty 200 body unless the request
+        // carries a runtime-generated PoToken; ANDROID-issued track URLs
+        // don't have that requirement (well-known workaround used by e.g.
+        // the youtube-transcript-api project), so this is the current
+        // (2026) reliable way to get real caption text, not just track
+        // metadata. -----------------------------------------------------------
         try {
-          const apiKey =
-            (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("INNERTUBE_API_KEY")) ||
-            "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-          const clientVersion =
-            (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("INNERTUBE_CLIENT_VERSION")) || "2.20240101.00.00";
+          const apiKey = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
           const videoId = new URLSearchParams(location.search).get("v") || location.pathname.match(/\/shorts\/([^/?]+)/)?.[1];
 
           const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              context: { client: { clientName: "WEB", clientVersion } },
+              context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
               videoId,
             }),
           });
@@ -547,7 +557,7 @@ async function pollRemoteJobs() {
     const { jobs } = await res.json();
     for (const job of jobs || []) {
       try {
-        const result = await fetchTranscriptViaTab(job.video_id);
+        const result = await fetchTranscript(job.video_id);
         await fetch(`${UC_WEB_BASE}/api/uc-jobs/${job.id}?key=${UC_SHARED_SECRET}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
